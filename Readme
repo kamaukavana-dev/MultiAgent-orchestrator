@@ -1,0 +1,55 @@
+# Senior/Worker/Reviewer Orchestrator
+
+## Setup
+```
+pip install anthropic --break-system-packages
+
+# Fixed roles (each: API key + optional custom endpoint + optional model)
+export SENIOR_API_KEY=...      SENIOR_BASE_URL=...      # BASE_URL optional
+export REVIEWER_API_KEY=...    REVIEWER_BASE_URL=...
+
+# Worker key pool — one numbered slot per key you want balanced (we run 4).
+# Any Anthropic-SDK-compatible provider works; unset BASE_URL = SDK default.
+export WORKER_1_API_KEY=...    WORKER_1_BASE_URL=...
+export WORKER_2_API_KEY=...    WORKER_2_BASE_URL=...
+export WORKER_3_API_KEY=...    WORKER_3_BASE_URL=...
+export WORKER_4_API_KEY=...    WORKER_4_BASE_URL=...
+
+# Fallbacks for anything unset: ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL / ORCH_MODEL
+# Per-role model override: SENIOR_MODEL / REVIEWER_MODEL / WORKER_N_MODEL
+
+export TEST_CMD="pytest"   # REQUIRED — the orchestrator refuses to run without it
+export ORCH_MAX_WORKERS=8  # optional cap on plan size (default 8)
+```
+
+## Run
+```
+python orchestrator.py "Build a simple two-file Python CLI: core logic module + CLI entrypoint module."
+```
+
+## What happens
+1. Senior decomposes the goal into 1..N subtasks with NON-OVERLAPPING file scopes (JSON, no prose).
+2. PRE-FLIGHT (`guards.validate_plan`): before ANY worker is called, the plan's structure is
+   validated and every scope entry is pairwise-checked across subtasks — same file, or one entry
+   being a parent directory of another, rejects the whole plan and aborts. Absolute paths and
+   `../` traversal are also rejected.
+3. Each subtask gets its own git worktree + branch (`<owner>/<task_id>`) — physically isolated.
+   The worker key pool is round-robined across the plan's owners, so N subtasks balance across
+   the 4 keys deterministically.
+4. Worker implements, orchestrator writes the files and commits.
+5. Orchestrator runs `$TEST_CMD` as a real subprocess inside the worktree, then
+   `guards.verify_test_run` requires BOTH exit code 0 AND a regex-parsed executed-test count
+   strictly > 0 (pytest/unittest/jest/mocha/cargo/TAP summaries). An empty suite that exits 0,
+   or output with no parseable summary, is an automatic reject — no empty-suite bypass.
+6. Orchestrator diffs the branch and checks every changed file is inside the worker's declared
+   `file_scope`. Any file outside scope = automatic reject, no model call needed.
+7. If tests verify and scope is clean, Reviewer sees the real diff + real test output and gives
+   an approve/reject verdict.
+8. On reject: worker gets reassigned with the exact rejection reason, up to `MAX_REASSIGN_ATTEMPTS` (default 3).
+9. Approved branches merge into `main` ONE AT A TIME in sequence — never concurrently.
+10. Full audit trail (every attempt, rejection reason, verdict) is written to `task_graph.json`.
+
+## Known gaps to fix before trusting this on real work
+- No timeout/retry-on-API-error handling yet — add before long unattended runs.
+- `run_tests` assumes the test runner is installed in the environment; for a brand new repo you
+  may need a bootstrap step (e.g. a venv per worktree).

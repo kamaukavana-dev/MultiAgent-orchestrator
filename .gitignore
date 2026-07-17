@@ -1,0 +1,5 @@
+.env
+.venv/
+worktrees/
+project_repo/
+task_graph.json

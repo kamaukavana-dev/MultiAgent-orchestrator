@@ -18,19 +18,53 @@ import anthropic
 from config import provider_for
 
 SENIOR_SYSTEM = """You are the Senior Engineer. You do not write code.
+You will be shown the repo's REAL file tree and current file contents.
 You decompose a goal into between 1 and {max_workers} subtasks with STRICTLY
 NON-OVERLAPPING file scopes: no two subtasks may list the same file, and no
 subtask's scope entry may be a parent directory of another subtask's entry.
 Use as many subtasks as the goal genuinely needs — no more.
 
-CRITICAL: every subtask must be INDEPENDENTLY TESTABLE. Each worker's branch
-is tested in ISOLATION — files from other subtasks will NOT exist yet. So each
-subtask's file_scope MUST include both its implementation file(s) AND its own
-test file(s), and its tests must pass with only its own files present. NEVER
-put a module in one subtask and its tests in another. NEVER give a subtask a
-test file that imports another subtask's module.
+Scope paths MUST be real paths from the shown tree (to modify existing files)
+or new paths consistent with the repo's actual layout and package/module
+naming. NEVER invent a directory structure that contradicts the tree.
 
-CRITICAL: when subtasks share an interface (one imports the other after the
+Each subtask may also list "context_files": existing repo files the worker
+should SEE read-only (interfaces it must match, conventions to follow) but is
+NOT allowed to modify. Context files may overlap freely between subtasks —
+only file_scope must be exclusive.
+
+CRITICAL: every subtask must be INDEPENDENTLY BUILDABLE AND TESTABLE. Each
+worker's branch starts from current main — existing repo files are present,
+but files created by OTHER subtasks in this plan will NOT exist yet, and the
+FULL build + test suite (not just the new tests) runs on that branch. So a
+subtask's files must COMPILE and TEST GREEN against only current main + its
+own files.
+
+This has HARD consequences that OVERRIDE how the goal is phrased — obey them
+even if the user asked to split things differently:
+  - A source file and the tests that exercise it MUST be in the SAME subtask.
+    A test cannot compile without the class it tests, so splitting them makes
+    a branch that cannot build. NEVER put a class in one subtask and its test
+    in another.
+  - Everything a subtask needs to COMPILE must be in that subtask or already
+    on main. If new code needs a new dependency or build-file change (e.g. a
+    new library in pom.xml / build.gradle / package.json / requirements), that
+    build-file edit MUST be in the SAME subtask's file_scope. NEVER leave a
+    subtask depending on a dependency another subtask is supposed to add.
+  - If a shared build file (pom.xml, package.json, ...) would need edits from
+    two different features, either put all its edits in ONE subtask that owns
+    that file, or fold the features into a single subtask. The build file can
+    only be owned by one subtask (scopes are exclusive).
+  - A worker must NEVER silently drop a required annotation, dependency, or
+    behavior to make a branch compile. If satisfying the goal needs something
+    outside its scope, that is a PLANNING error — you must widen the scope so
+    the subtask is self-sufficient, not shrink the implementation.
+
+When in doubt, prefer FEWER, SELF-SUFFICIENT subtasks over many fragmented
+ones. A single subtask owning [Feature.java, FeatureTest.java, pom.xml] that
+builds green beats three that don't.
+
+CRITICAL: when subtasks share a NEW interface (one imports the other after the
 final merge), your descriptions must PIN THE EXACT CONTRACT — module names,
 function names, signatures, exception types — identically in BOTH subtasks'
 descriptions, so independently-working workers cannot drift apart. After all
@@ -40,25 +74,32 @@ Each subtask's "owner" must be a short slug like "worker_1", "worker_2", ...
 Respond ONLY with JSON, no prose, no markdown fences:
 {{
   "subtasks": [
-    {{"id": "task_1", "owner": "worker_1", "description": "...", "file_scope": ["module.py", "test_module.py"]}},
-    {{"id": "task_2", "owner": "worker_2", "description": "...", "file_scope": ["other.py", "test_other.py"]}}
+    {{"id": "task_1", "owner": "worker_1", "description": "...",
+      "file_scope": ["real/path/module.py", "real/path/test_module.py"],
+      "context_files": ["real/path/existing_interface.py"]}}
   ]
 }}
 """
 
-WORKER_SYSTEM = """You are a Worker Engineer. You will be given ONE subtask and an
-exact list of files you are allowed to create or modify. You must NOT touch any
-file outside that list.
+WORKER_SYSTEM = """You are a Worker Engineer. You will be given ONE subtask, the
+repo's file tree, the CURRENT contents of the files you own, and possibly some
+read-only context files. You must NOT touch any file outside your assigned list.
 
-You have NO tools, NO filesystem access, and NO ability to read, explore, or
-run anything. Do not announce plans, do not say you will look at files — you
-cannot. The ONLY thing you can do is return complete file contents in JSON.
+You have NO tools and NO filesystem access beyond what is shown in your prompt.
+Do not announce plans to explore or read anything — everything you get to see
+is already in the prompt. The ONLY thing you can do is return complete file
+contents in JSON.
 
-Your branch is tested in ISOLATION: only the files you return will exist.
-Write complete, working, self-contained file contents, INCLUDING real tests
-inside your allowed files — submissions whose test run executes zero tests are
-automatically rejected by the orchestrator. Do not import modules that are not
-in your allowed file list or the standard library.
+For files that already exist, you are MODIFYING them: return the ENTIRE new
+file content (not a diff, not a fragment), preserving everything that should
+survive your change. Match the conventions, package names, and interfaces
+visible in the provided tree and context files exactly.
+
+Your branch is tested in ISOLATION: current main plus only YOUR files. Write
+complete, working content, INCLUDING real tests inside your allowed files —
+submissions whose test run executes zero tests are automatically rejected.
+Do not import anything that is not in the shown tree, your own files, or the
+standard library / declared project dependencies.
 
 Respond ONLY with JSON, no prose, no markdown fences:
 {
@@ -199,21 +240,28 @@ def _normalize_worker(obj: dict) -> dict:
     return {"files": files, "notes": str(obj.get("notes", ""))}
 
 
-def senior_decompose(goal: str, max_workers: int, plan_feedback: str = "") -> dict:
+def senior_decompose(goal: str, max_workers: int, repo_snapshot: str = "",
+                     plan_feedback: str = "") -> dict:
     system = SENIOR_SYSTEM.format(max_workers=max_workers)
     prompt = f"Goal: {goal}"
+    if repo_snapshot:
+        prompt += f"\n\n=== CURRENT REPOSITORY ===\n{repo_snapshot}"
     if plan_feedback:
         prompt += (
             f"\n\nYOUR PREVIOUS PLAN WAS REJECTED by pre-flight validation:\n{plan_feedback}\n"
             f"Produce a corrected plan. Every subtask needs: 'id' (slug), 'owner' (slug like "
-            f"'worker_1'), 'description' (non-empty), 'file_scope' (non-empty list of relative "
-            f"file paths, no overlap with any other subtask)."
+            f"'worker_1'), 'description' (non-empty), 'file_scope' (non-empty list of REAL "
+            f"repo-relative paths, no overlap with any other subtask). Use paths that actually "
+            f"fit the repo tree shown above."
         )
     return _call_json("senior", system, prompt, required_key="subtasks")
 
 
-def worker_implement(owner: str, description: str, file_scope: list[str], rejection_reason: str = "") -> dict:
-    prompt = f"Subtask: {description}\nAllowed files ONLY: {file_scope}"
+def worker_implement(owner: str, description: str, file_scope: list[str],
+                     context: str = "", rejection_reason: str = "") -> dict:
+    prompt = f"Subtask: {description}\nFiles you may create or modify (ONLY these): {file_scope}"
+    if context:
+        prompt += f"\n\n=== REPOSITORY CONTEXT ===\n{context}"
     if rejection_reason:
         prompt += f"\n\nPREVIOUS ATTEMPT WAS REJECTED. Reason: {rejection_reason}\nFix this and resubmit."
     return _call_json(owner, WORKER_SYSTEM, prompt, required_key="files",

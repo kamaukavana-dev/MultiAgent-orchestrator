@@ -58,6 +58,16 @@ def executed_test_count(output: str) -> int | None:
     if m:
         counts.append(int(m.group(1)) + int(m.group(2)))
 
+    # Maven Surefire/Failsafe: "Tests run: 5, Failures: 0, Errors: 0, Skipped: 1"
+    # The summary line repeats per-class and once as a total — max() handles it.
+    for m in re.finditer(r"Tests run: (\d+), Failures: \d+, Errors: \d+(?:, Skipped: (\d+))?", output):
+        counts.append(int(m.group(1)) - int(m.group(2) or 0))
+
+    # Gradle: "5 tests completed, 1 failed"
+    m = re.search(r"(\d+) tests? completed", output)
+    if m:
+        counts.append(int(m.group(1)))
+
     # TAP: "# tests 3"
     m = re.search(r"^# tests (\d+)", output, re.MULTILINE)
     if m:

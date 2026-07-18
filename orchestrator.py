@@ -17,10 +17,12 @@ a subprocess exit code AND a parsed test count.
 """
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
 import git_ops
 import guards
+import repo_context
 import roles
 from state import TaskGraph, Subtask
 
@@ -61,9 +63,16 @@ def process_subtask(graph: TaskGraph, subtask: Subtask, test_cmd: list[str]) -> 
         subtask.branch = branch
         worktree_path = git_ops.create_worker_worktree(config.REPO_ROOT, config.WORKTREE_ROOT, branch)
 
-        # --- Worker implements ---
+        # --- Worker implements, seeing the CURRENT contents of its own files
+        # (so it modifies rather than blindly overwrites) plus any read-only
+        # context files the Senior assigned. Built from the fresh worktree,
+        # which is current main at attempt start. ---
+        context = repo_context.worker_context(
+            worktree_path, subtask.file_scope, subtask.context_files,
+        )
         result = roles.worker_implement(
             subtask.owner, subtask.description, subtask.file_scope,
+            context=context,
             rejection_reason=subtask.last_rejection_reason,
         )
         write_worker_files(worktree_path, result.get("files", {}))
@@ -117,13 +126,18 @@ def run(goal: str, test_cmd: list[str]):
 
     print(f"=== Senior decomposing goal ===\n{goal}\n")
 
+    # Snapshot the REAL repo (tree + current contents) so the Senior plans
+    # against actual paths and package names, never an imagined layout.
+    snapshot = repo_context.repo_snapshot(config.REPO_ROOT)
+
     # --- PRE-FLIGHT: validate the plan BEFORE any worker is called. A rejected
     # plan is fed back to the Senior with the exact problems, up to the same
     # attempt cap workers get; only a still-broken plan aborts the run. ---
     plan = None
     feedback = ""
     for plan_attempt in range(1, config.MAX_REASSIGN_ATTEMPTS + 1):
-        candidate = roles.senior_decompose(goal, max_workers=config.MAX_WORKERS, plan_feedback=feedback)
+        candidate = roles.senior_decompose(goal, max_workers=config.MAX_WORKERS,
+                                           repo_snapshot=snapshot, plan_feedback=feedback)
         problems = guards.validate_plan(candidate)
         if isinstance(candidate, dict) and len(candidate.get("subtasks") or []) > config.MAX_WORKERS:
             problems.append(f"plan has {len(candidate['subtasks'])} subtasks, max is {config.MAX_WORKERS}")
@@ -140,7 +154,11 @@ def run(goal: str, test_cmd: list[str]):
                          "or malformed structure) on every attempt. Aborting before any worker runs.")
 
     # Dynamic 1..N subtasks — however many the validated plan contains.
-    subtasks = [Subtask(id=t["id"], owner=t["owner"], description=t["description"], file_scope=t["file_scope"])
+    # context_files is optional and read-only, so a missing/malformed value
+    # degrades to "no extra context" rather than failing the plan.
+    subtasks = [Subtask(id=t["id"], owner=t["owner"], description=t["description"],
+                        file_scope=t["file_scope"],
+                        context_files=[c for c in (t.get("context_files") or []) if isinstance(c, str)])
                 for t in plan["subtasks"]]
     graph = TaskGraph(goal=goal, subtasks=subtasks)
     graph.save("task_graph.json")
@@ -153,11 +171,35 @@ def run(goal: str, test_cmd: list[str]):
         print(f"  - {s.id} -> {s.owner} [key slot: {prov.name}]: {s.description}  scope={s.file_scope}")
 
     # Process each subtask (implement/test/review/reassign) BEFORE any merging.
+    # Workers are physically isolated — own worktree, own branch, own API-key
+    # slot — so they run CONCURRENTLY (this is the "several models at once").
+    # Only merging stays strictly sequential. ORCH_PARALLELISM caps how many
+    # run at a time (default = number of subtasks, i.e. all at once).
     approved = []
-    for subtask in graph.subtasks:
-        if process_subtask(graph, subtask, test_cmd):
-            approved.append(subtask)
-        graph.save("task_graph.json")
+    if config.PARALLELISM <= 1 or len(graph.subtasks) <= 1:
+        for subtask in graph.subtasks:
+            if process_subtask(graph, subtask, test_cmd):
+                approved.append(subtask)
+            graph.save("task_graph.json")
+    else:
+        max_workers = min(config.PARALLELISM, len(graph.subtasks))
+        print(f"Running {len(graph.subtasks)} workers concurrently "
+              f"(up to {max_workers} at a time).")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(process_subtask, graph, s, test_cmd): s
+                       for s in graph.subtasks}
+            for fut in as_completed(futures):
+                subtask = futures[fut]
+                try:
+                    if fut.result():
+                        approved.append(subtask)
+                except Exception as e:  # a worker crash must not sink the whole run
+                    subtask.status = "failed"
+                    subtask.log("error", f"{type(e).__name__}: {e}")
+                    print(f"[{subtask.id}] ERRORED — {type(e).__name__}: {e}")
+                graph.save("task_graph.json")
+        # Merge in the plan's original order, not the order they happened to finish.
+        approved.sort(key=lambda s: [x.id for x in graph.subtasks].index(s.id))
 
     # Sequential merge — one at a time, in the order approved, never concurrent.
     for subtask in approved:

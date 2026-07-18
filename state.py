@@ -20,6 +20,7 @@ class Subtask:
     owner: str                     # worker slug from the Senior's plan, e.g. "worker_1" ... "worker_n"
     description: str
     file_scope: list[str]          # exact files/paths this worker is allowed to touch
+    context_files: list[str] = field(default_factory=list)  # read-only files the worker may SEE, not modify
     branch: str = ""
     status: str = "pending"        # pending -> in_progress -> reviewing -> approved/rejected -> merged
     attempts: int = 0

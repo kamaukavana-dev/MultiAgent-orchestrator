@@ -58,6 +58,10 @@ WORKTREE_ROOT = os.environ.get("ORCH_WORKTREE_ROOT", "./worktrees")
 
 MAX_REASSIGN_ATTEMPTS = 3   # hard cap so a broken worker doesn't loop forever
 MAX_WORKERS = int(os.environ.get("ORCH_MAX_WORKERS", "8"))  # upper bound on plan size
+# How many workers run at once. Default 4 matches the typical key pool; set 1
+# to force fully sequential, or higher to fan out more. Each concurrent worker
+# uses its own worktree + key slot, so real concurrency needs enough key slots.
+PARALLELISM = int(os.environ.get("ORCH_PARALLELISM", "4"))
 
 
 @dataclass(frozen=True)

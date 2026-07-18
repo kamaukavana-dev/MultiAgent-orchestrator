@@ -26,12 +26,25 @@ def ensure_repo_initialized(repo_root: str):
     if not os.path.isdir(os.path.join(repo_root, ".git")):
         os.makedirs(repo_root, exist_ok=True)
         run(["git", "init"], cwd=repo_root)
-        # Ignore runtime artifacts up front — otherwise pytest's __pycache__
-        # gets committed and every subtask trips the scope check on .pyc files.
-        with open(os.path.join(repo_root, ".gitignore"), "w") as f:
-            f.write("__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n")
+    # Ignore runtime artifacts — otherwise pytest's __pycache__ gets committed
+    # and every subtask trips the scope check on .pyc files. Checked on EVERY
+    # run, not just fresh init: a repo initialized before this guard existed
+    # (or with a hand-rolled .gitignore missing these entries) would otherwise
+    # fail every subtask forever.
+    gitignore_path = os.path.join(repo_root, ".gitignore")
+    required = ["__pycache__/", "*.pyc", ".pytest_cache/", "node_modules/"]
+    existing = ""
+    if os.path.isfile(gitignore_path):
+        with open(gitignore_path) as f:
+            existing = f.read()
+    missing = [r for r in required if r not in existing.splitlines()]
+    if missing:
+        with open(gitignore_path, "a") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write("\n".join(missing) + "\n")
         run(["git", "add", ".gitignore"], cwd=repo_root)
-        run(["git", "commit", "-m", "init"], cwd=repo_root)
+        run(["git", "commit", "-m", "chore: ignore runtime artifacts"], cwd=repo_root)
 
 
 def create_worker_worktree(repo_root: str, worktree_root: str, branch: str) -> str:

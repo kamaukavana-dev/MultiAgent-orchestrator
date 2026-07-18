@@ -3,3 +3,8 @@
 worktrees/
 project_repo/
 task_graph.json
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.claude/

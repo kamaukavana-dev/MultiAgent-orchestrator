@@ -26,8 +26,15 @@ from state import TaskGraph, Subtask
 
 
 def write_worker_files(worktree_path: str, files: dict[str, str]):
+    """Writes worker output into its worktree — and ONLY its worktree.
+    A path that is absolute or resolves outside the worktree (../ traversal)
+    would land outside git's view and never appear in the scope-check diff,
+    silently bypassing the whole guard chain. Hard error, not a skip."""
+    root = os.path.realpath(worktree_path)
     for rel_path, content in files.items():
-        full_path = os.path.join(worktree_path, rel_path)
+        full_path = os.path.realpath(os.path.join(root, rel_path))
+        if not (full_path == root or full_path.startswith(root + os.sep)):
+            raise RuntimeError(f"worker path escapes its worktree: {rel_path!r}")
         os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
         with open(full_path, "w") as f:
             f.write(content)
@@ -109,17 +116,28 @@ def run(goal: str, test_cmd: list[str]):
     git_ops.ensure_repo_initialized(config.REPO_ROOT)
 
     print(f"=== Senior decomposing goal ===\n{goal}\n")
-    plan = roles.senior_decompose(goal, max_workers=config.MAX_WORKERS)
 
-    # --- PRE-FLIGHT: validate the plan BEFORE any worker is called ---
-    problems = guards.validate_plan(plan)
-    if isinstance(plan, dict) and len(plan.get("subtasks") or []) > config.MAX_WORKERS:
-        problems.append(f"plan has {len(plan['subtasks'])} subtasks, max is {config.MAX_WORKERS}")
-    if problems:
+    # --- PRE-FLIGHT: validate the plan BEFORE any worker is called. A rejected
+    # plan is fed back to the Senior with the exact problems, up to the same
+    # attempt cap workers get; only a still-broken plan aborts the run. ---
+    plan = None
+    feedback = ""
+    for plan_attempt in range(1, config.MAX_REASSIGN_ATTEMPTS + 1):
+        candidate = roles.senior_decompose(goal, max_workers=config.MAX_WORKERS, plan_feedback=feedback)
+        problems = guards.validate_plan(candidate)
+        if isinstance(candidate, dict) and len(candidate.get("subtasks") or []) > config.MAX_WORKERS:
+            problems.append(f"plan has {len(candidate['subtasks'])} subtasks, max is {config.MAX_WORKERS}")
+        if not problems:
+            plan = candidate
+            break
         for p in problems:
             print(f"  PLAN REJECTED: {p}")
+        feedback = "\n".join(problems)
+        print(f"  Re-asking Senior with the validation errors "
+              f"(attempt {plan_attempt}/{config.MAX_REASSIGN_ATTEMPTS}).")
+    if plan is None:
         raise SystemExit("Senior's plan failed pre-flight validation (scope overlap "
-                         "or malformed structure). Aborting before any worker runs.")
+                         "or malformed structure) on every attempt. Aborting before any worker runs.")
 
     # Dynamic 1..N subtasks — however many the validated plan contains.
     subtasks = [Subtask(id=t["id"], owner=t["owner"], description=t["description"], file_scope=t["file_scope"])
@@ -152,6 +170,21 @@ def run(goal: str, test_cmd: list[str]):
             print(f"[{subtask.id}] merged to main cleanly.")
         graph.merge_order.append(subtask.id)
         graph.save("task_graph.json")
+
+    # --- FINAL INTEGRATION GATE: per-branch tests ran in isolation, so cross-
+    # subtask interface drift (worker A exporting sub() while worker B calls
+    # subtract()) only becomes observable here, on the merged whole. Same rule
+    # as everywhere else: the verdict comes from a real subprocess run.
+    if approved:
+        exit_code, test_output = run_tests(config.REPO_ROOT, test_cmd)
+        ok, reason = guards.verify_test_run(exit_code, test_output)
+        print(f"\n=== Integration test on merged main: "
+              f"{'PASS' if ok else 'FAIL'} ({reason}) ===")
+        if not ok:
+            print(test_output[-2000:])
+            print("Merged branches passed in isolation but the COMBINED suite fails — "
+                  "likely an interface mismatch between subtasks. Needs human review.")
+            raise SystemExit(1)
 
     print("\n=== Done. See task_graph.json for full audit trail. ===")
 

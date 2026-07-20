@@ -92,12 +92,23 @@ def changed_files(repo_root: str, branch: str, base: str = "main") -> list[str]:
     return [f for f in result.stdout.strip().splitlines() if f]
 
 
+def _norm(path: str) -> str:
+    """Canonical repo-relative form. MUST match guards._norm so the pre-flight
+    validator and this runtime check agree on what a path is: a plan entry like
+    './pkg/mod.py' validates fine there but git diff reports 'pkg/mod.py' here,
+    so comparing raw strings would flag a worker's OWN assigned file as a scope
+    violation and auto-reject correct work."""
+    return os.path.normpath(path.strip()).replace("\\", "/")
+
+
 def check_scope_violation(repo_root: str, branch: str, allowed_scope: list[str]) -> list[str]:
-    """Returns list of files touched OUTSIDE the allowed scope. Empty list = clean."""
-    touched = changed_files(repo_root, branch)
+    """Returns list of files touched OUTSIDE the allowed scope. Empty list = clean.
+    Both sides are normalized so './pkg/x', 'pkg/x/' and 'pkg/x' compare equal."""
+    allowed = [_norm(a) for a in allowed_scope]
     violations = []
-    for f in touched:
-        if not any(f == allowed or f.startswith(allowed.rstrip("/") + "/") for allowed in allowed_scope):
+    for f in changed_files(repo_root, branch):
+        nf = _norm(f)
+        if not any(nf == a or nf.startswith(a.rstrip("/") + "/") for a in allowed):
             violations.append(f)
     return violations
 

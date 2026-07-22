@@ -62,6 +62,10 @@ MAX_WORKERS = int(os.environ.get("ORCH_MAX_WORKERS", "8"))  # upper bound on pla
 # to force fully sequential, or higher to fan out more. Each concurrent worker
 # uses its own worktree + key slot, so real concurrency needs enough key slots.
 PARALLELISM = int(os.environ.get("ORCH_PARALLELISM", "4"))
+# Escalation (#4): the model a worker's FINAL attempt is retried on, after it
+# has already failed with its normal model. Same provider/key, stronger brain.
+# Empty/unset -> no escalation (final attempt uses the worker's normal model).
+ESCALATION_MODEL = os.environ.get("ORCH_ESCALATION_MODEL", "").strip() or None
 
 
 @dataclass(frozen=True)

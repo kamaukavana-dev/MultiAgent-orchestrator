@@ -50,14 +50,35 @@ def run_tests(worktree_path: str, test_cmd: list[str]) -> tuple[int, str]:
     return result.returncode, (result.stdout + "\n" + result.stderr)
 
 
+def _feedback_text(reason: str, required_changes: list[str]) -> str:
+    """Combines the reviewer's reason + itemized required changes into the
+    single string the worker sees on its next attempt."""
+    parts = []
+    if reason:
+        parts.append(reason)
+    if required_changes:
+        parts.append("Required changes:\n" + "\n".join(f"  - {c}" for c in required_changes))
+    return "\n".join(parts) or "unspecified"
+
+
 def process_subtask(graph: TaskGraph, subtask: Subtask, test_cmd: list[str]) -> bool:
-    """Runs one subtask through implement -> test -> review, with reject/reassign.
-    Returns True if approved, False if it exhausted attempts."""
+    """Runs one subtask through implement -> test -> review, looping on the
+    reviewer's 'revise' verdict with concrete required changes fed back to the
+    same worker. The FINAL attempt escalates to a stronger model (config.
+    ESCALATION_MODEL) if one is configured. Returns True iff approved."""
 
     while subtask.attempts < config.MAX_REASSIGN_ATTEMPTS:
         subtask.attempts += 1
         subtask.status = "in_progress"
-        subtask.log("assigned", f"attempt {subtask.attempts}")
+        # Escalation (#4): on the last allowed attempt, hand the work to a
+        # stronger model instead of burning the try on the same one that has
+        # already failed twice. Rescues the exact 3-strikes death we saw.
+        is_last = subtask.attempts == config.MAX_REASSIGN_ATTEMPTS
+        model_override = config.ESCALATION_MODEL if (is_last and config.ESCALATION_MODEL) else None
+        subtask.log("assigned", f"attempt {subtask.attempts}"
+                    + (f" [escalated -> {model_override}]" if model_override else ""))
+        if model_override:
+            print(f"[{subtask.id}] ESCALATING final attempt to model '{model_override}'.")
 
         branch = f"{subtask.owner}/{subtask.id}"
         subtask.branch = branch
@@ -74,6 +95,7 @@ def process_subtask(graph: TaskGraph, subtask: Subtask, test_cmd: list[str]) -> 
             subtask.owner, subtask.description, subtask.file_scope,
             context=context,
             rejection_reason=subtask.last_rejection_reason,
+            model_override=model_override,
         )
         write_worker_files(worktree_path, result.get("files", {}))
         git_ops.commit_worker_changes(worktree_path, f"{subtask.id}: {result.get('notes','')}")
@@ -84,31 +106,45 @@ def process_subtask(graph: TaskGraph, subtask: Subtask, test_cmd: list[str]) -> 
         tests_ok, tests_reason = guards.verify_test_run(exit_code, test_output)
         subtask.log("tested", f"exit_code={exit_code} verdict={tests_reason}")
 
-        # Automatic reject on failure OR on a zero-test/unparseable run —
-        # exit code 0 with an empty suite does not get past this line.
-        if not tests_ok:
-            subtask.status = "rejected"
-            subtask.last_rejection_reason = f"Test verification failed: {tests_reason}\n{test_output[:2000]}"
-            subtask.log("rejected", tests_reason)
-            print(f"[{subtask.id}] REJECTED — {tests_reason}. Reassigning (attempt {subtask.attempts}/{config.MAX_REASSIGN_ATTEMPTS}).")
-            continue
-
-        # --- Scope violation check on the REAL diff ---
+        # --- Scope violation check on the REAL diff (needed for the reviewer) ---
         violations = git_ops.check_scope_violation(config.REPO_ROOT, branch, subtask.file_scope)
         diff_text = git_ops.get_diff_text(config.REPO_ROOT, branch)
 
-        verdict = roles.reviewer_verdict(diff_text, exit_code, test_output, violations)
+        # The reviewer now sees the SUBTASK, the repo CONTEXT, the real diff, and
+        # the real test result together — so it can judge completeness/wiring, not
+        # just "did it compile". A failing test run is passed through as context
+        # rather than short-circuiting, so the reviewer states WHAT to fix.
+        verdict = roles.reviewer_verdict(
+            subtask.description, diff_text, exit_code, test_output, violations,
+            context=context,
+        )
+        # Belt-and-suspenders: tests must pass to APPROVE, no matter what the
+        # reviewer says. A green-looking review over a red test run downgrades
+        # to 'revise' — the empty-suite / exit-code guard is never overridden.
+        if not tests_ok and verdict.get("verdict") == "approve":
+            verdict = {"verdict": "revise",
+                       "reason": f"Test verification failed: {tests_reason}",
+                       "required_changes": [f"Make the test run pass and execute >0 tests. {tests_reason}"]}
         subtask.status = "reviewing"
         subtask.log("reviewed", str(verdict))
 
-        if verdict.get("verdict") == "approve":
+        v = verdict.get("verdict")
+        if v == "approve":
             subtask.status = "approved"
             print(f"[{subtask.id}] APPROVED ({tests_reason}).")
             return True
-        else:
-            subtask.status = "rejected"
-            subtask.last_rejection_reason = verdict.get("reason", "unspecified")
-            print(f"[{subtask.id}] REJECTED — {subtask.last_rejection_reason}. Reassigning (attempt {subtask.attempts}/{config.MAX_REASSIGN_ATTEMPTS}).")
+
+        # 'revise' and 'reject' both loop back to the same worker with concrete
+        # feedback. 'reject' additionally means the approach was wrong, but the
+        # worker still gets the reasoning and another attempt within the cap.
+        feedback = _feedback_text(verdict.get("reason", ""), verdict.get("required_changes", []))
+        if not tests_ok:
+            feedback += f"\n\nTest output (tail):\n{test_output[-1500:]}"
+        subtask.status = "rejected"
+        subtask.last_rejection_reason = feedback
+        subtask.log(v or "rejected", feedback[:400])
+        print(f"[{subtask.id}] {(v or 'REJECTED').upper()} — {verdict.get('reason','')[:160]} "
+              f"(attempt {subtask.attempts}/{config.MAX_REASSIGN_ATTEMPTS}).")
 
     subtask.status = "failed"
     print(f"[{subtask.id}] FAILED after {config.MAX_REASSIGN_ATTEMPTS} attempts. Needs human review.")

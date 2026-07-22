@@ -108,12 +108,44 @@ Respond ONLY with JSON, no prose, no markdown fences:
 }
 """
 
-REVIEWER_SYSTEM = """You are the Reviewer. You will be given a diff and REAL test
-output (exit code + stdout/stderr) that was captured by the orchestrator, not
-self-reported by the worker. You do not re-run anything and you do not trust
-claims of success that aren't backed by the test output shown to you.
-Respond ONLY with JSON, no prose, no markdown fences:
-{"verdict": "approve" or "reject", "reason": "..."}
+REVIEWER_SYSTEM = """You are a Staff Engineer doing code review. You are given the
+subtask the worker was asked to do, the repository context, the worker's diff,
+and REAL test output (exit code + stdout/stderr) captured by the orchestrator —
+not self-reported by the worker. You never re-run anything and you never trust
+claims of success that the test output does not back up.
+
+Tests passing proves internal consistency, NOT correctness or completeness. A
+diff can compile and pass its own tests while being wrong, incomplete, or dead
+code. Your job is to catch exactly that. Review against this rubric:
+
+  1. COMPLETENESS — does the diff actually accomplish everything the subtask
+     asked? Nothing silently dropped, stubbed, or narrowed to make it compile?
+  2. WIRING — is new code actually CONNECTED to the system, or orphaned? A new
+     DTO/validator/service the subtask implies should be USED, but which
+     nothing references or invokes, is a defect. New request-handling code
+     with no test proving the path is reachable is a defect.
+  3. TEST DEPTH — do the tests exercise real behavior and edge cases, or are
+     they shallow/tautological (asserting constants, re-testing the framework,
+     never touching the failure paths the subtask named)?
+  4. CORRECTNESS — logic errors, wrong signatures, mismatched interfaces with
+     existing code shown in context, off-by-one, unhandled null/empty/error.
+  5. QUALITY — naming, obvious security issues (injection, plaintext secrets),
+     resource leaks, glaring style breaks from the surrounding code.
+
+Verdicts:
+  - "approve": meets the subtask fully and is sound. Merge it.
+  - "revise":  fixable problems. You MUST list concrete, specific required
+     changes — file + what to change + why — so the same worker can fix it and
+     resubmit. Do NOT say "improve error handling"; say "register() takes raw
+     User; change it to accept @Valid RegisterRequest so the validation you
+     added actually runs". A failing test run is grounds for "revise".
+  - "reject": fundamentally wrong approach that a revise cannot salvage.
+
+Hold the line on completeness and wiring especially — those are the defects
+that pass tests and still ship broken. Respond ONLY with JSON, no prose, no
+markdown fences:
+{"verdict": "approve" | "revise" | "reject", "reason": "...",
+ "required_changes": ["specific change 1", "specific change 2"]}
 """
 
 
@@ -122,13 +154,15 @@ API_TIMEOUT_S = 300.0
 API_MAX_TOKENS = 16000  # workers return whole files inline — 4k truncated real replies mid-JSON
 
 
-def _call(role_key: str, system: str, user_content: str) -> str:
+def _call(role_key: str, system: str, user_content: str, model_override: str | None = None) -> str:
     provider = provider_for(role_key)
     # base_url is passed dynamically — only when configured, never hardcoded.
     client_kwargs = {"api_key": provider.api_key, "timeout": API_TIMEOUT_S, "max_retries": 0}
     if provider.base_url:
         client_kwargs["base_url"] = provider.base_url
     client = anthropic.Anthropic(**client_kwargs)
+    # Escalation may swap in a stronger model on the same provider/key.
+    model = model_override or provider.model
 
     # Retry transient failures (5xx, 429, timeouts, connection drops) with
     # exponential backoff. Auth/permission/bad-request errors fail fast.
@@ -136,7 +170,7 @@ def _call(role_key: str, system: str, user_content: str) -> str:
     for attempt in range(API_MAX_RETRIES):
         try:
             resp = client.messages.create(
-                model=provider.model,
+                model=model,
                 max_tokens=API_MAX_TOKENS,
                 system=system,
                 messages=[{"role": "user", "content": user_content}],
@@ -187,7 +221,7 @@ JSON_PARSE_RETRIES = 3
 
 
 def _call_json(role_key: str, system: str, user_content: str, required_key: str,
-               normalize=None) -> dict:
+               normalize=None, model_override: str | None = None) -> dict:
     """_call + _parse_json with a corrective retry loop. Some providers/proxies
     inject their own agent-style system prompts, making the model reply with
     prose or tool-call markup instead of the demanded JSON. On a parse failure
@@ -199,7 +233,7 @@ def _call_json(role_key: str, system: str, user_content: str, required_key: str,
     prompt = user_content
     last_err = ""
     for attempt in range(JSON_PARSE_RETRIES):
-        raw = _call(role_key, system, prompt)
+        raw = _call(role_key, system, prompt, model_override=model_override)
         try:
             obj = _parse_json(raw, required_key=required_key)
             return normalize(obj) if normalize else obj
@@ -258,23 +292,52 @@ def senior_decompose(goal: str, max_workers: int, repo_snapshot: str = "",
 
 
 def worker_implement(owner: str, description: str, file_scope: list[str],
-                     context: str = "", rejection_reason: str = "") -> dict:
+                     context: str = "", rejection_reason: str = "",
+                     model_override: str | None = None) -> dict:
     prompt = f"Subtask: {description}\nFiles you may create or modify (ONLY these): {file_scope}"
     if context:
         prompt += f"\n\n=== REPOSITORY CONTEXT ===\n{context}"
     if rejection_reason:
-        prompt += f"\n\nPREVIOUS ATTEMPT WAS REJECTED. Reason: {rejection_reason}\nFix this and resubmit."
+        prompt += (f"\n\nYOUR PREVIOUS ATTEMPT WAS SENT BACK BY CODE REVIEW. You MUST address "
+                   f"every point below, then resubmit the COMPLETE files:\n{rejection_reason}")
     return _call_json(owner, WORKER_SYSTEM, prompt, required_key="files",
-                      normalize=_normalize_worker)
+                      normalize=_normalize_worker, model_override=model_override)
 
 
-def reviewer_verdict(diff_text: str, test_exit_code: int, test_output: str, scope_violations: list[str]) -> dict:
+def _normalize_verdict(obj: dict) -> dict:
+    """Constrains the reviewer to the three-verdict schema and guarantees a
+    usable feedback string. An unknown verdict is treated as 'revise' (safer
+    than approving on ambiguity), and 'revise'/'reject' must carry actionable
+    text — reason and/or required_changes — or we force a retry."""
+    verdict = str(obj.get("verdict", "")).strip().lower()
+    if verdict not in ("approve", "revise", "reject"):
+        verdict = "revise"
+    reason = str(obj.get("reason", "")).strip()
+    changes = obj.get("required_changes") or []
+    if not isinstance(changes, list):
+        changes = [str(changes)]
+    changes = [str(c).strip() for c in changes if str(c).strip()]
+    if verdict in ("revise", "reject") and not reason and not changes:
+        raise ValueError("a 'revise'/'reject' verdict must include a non-empty "
+                         "'reason' or 'required_changes'")
+    return {"verdict": verdict, "reason": reason, "required_changes": changes}
+
+
+def reviewer_verdict(subtask_description: str, diff_text: str, test_exit_code: int,
+                     test_output: str, scope_violations: list[str],
+                     context: str = "") -> dict:
     if scope_violations:
         # Don't even bother calling the model — this is an automatic, non-negotiable reject.
-        return {"verdict": "reject", "reason": f"Scope violation, touched files outside assignment: {scope_violations}"}
-    prompt = (
-        f"Diff:\n{diff_text}\n\n"
+        return {"verdict": "reject",
+                "reason": f"Scope violation, touched files outside assignment: {scope_violations}",
+                "required_changes": [f"Do not modify {v}; it is outside your file scope." for v in scope_violations]}
+    prompt = f"SUBTASK the worker was asked to do:\n{subtask_description}\n"
+    if context:
+        prompt += f"\n=== REPOSITORY CONTEXT ===\n{context}\n"
+    prompt += (
+        f"\nWORKER'S DIFF:\n{diff_text}\n\n"
         f"Test exit code (0 = pass): {test_exit_code}\n"
         f"Test output:\n{test_output}"
     )
-    return _call_json("reviewer", REVIEWER_SYSTEM, prompt, required_key="verdict")
+    return _call_json("reviewer", REVIEWER_SYSTEM, prompt, required_key="verdict",
+                      normalize=_normalize_verdict)
